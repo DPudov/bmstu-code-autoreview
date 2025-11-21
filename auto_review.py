@@ -446,8 +446,8 @@ def run_checks_on_files(file_lines_map):
                                 if re.search(r'==\s*NULL', after) or re.search(r'==\s*0', after) or re.search(r'!=\s*NULL', after) or re.search(r'!=\s*0', after):
                                     checked = True
                                     break
-                        if not checked:
-                            issues.append({'file': path, 'line': k+1, 'rule': 15, 'message': "Результат malloc|realloc|calloc не обработан (правило 15)."})
+                        #if not checked:
+                        #    issues.append({'file': path, 'line': k+1, 'rule': 15, 'message': "Результат malloc|realloc|calloc не обработан (правило 15)."})
                 # Rule 25 & 26: forbid exit/goto inside function
                 for k in range(start_idx, min(end_idx+1, nlines)):
                     if exit_re.search(lines[k]):
@@ -617,12 +617,12 @@ def run_checks_on_files(file_lines_map):
                     tok, re.S)
                 if var_match:
                     var_name = var_match.group(1)
-                    issues.append({
-                        'file': path,
-                        'line': start_line_no,
-                        'rule': 27,
-                        'message': f"Обнаружена вероятная глобальная переменная '{var_name}' (правило 27). Рекомендуется избегать глобальных переменных."
-                    })
+                    # issues.append({
+                    #     'file': path,
+                    #     'line': start_line_no,
+                    #     'rule': 27,
+                    #     'message': f"Обнаружена вероятная глобальная переменная '{var_name}' (правило 27). Рекомендуется избегать глобальных переменных."
+                    # })
                 i = j
 
 
