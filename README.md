@@ -8,7 +8,7 @@
 
 2. Выполни следующую команду
 ```bash
-pip3 install requirements.txt
+pip3 install -r requirements.txt
 ```
 3. Укажи приватный gitlab token в default.conf в GITLAB_TOKEN. Поменяй название файла на script.conf
 
