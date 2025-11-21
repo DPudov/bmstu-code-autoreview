@@ -405,7 +405,7 @@ def run_checks_on_files(file_lines_map):
                         # ищем обработку в ближайших 10 строках или до конца функции
                         for t in range(k+1, min(k+11, end_idx+1)):
                             check_line = lines[t]
-                            # Проверка на NULL, 0, !v, v == 0, v != 0, v == NULL, v != NULL
+                            # Явные проверки
                             if re.search(r'\bif\s*\(\s*!\s*' + re.escape(v) + r'\s*\)', check_line):
                                 checked = True
                                 break
@@ -433,6 +433,19 @@ def run_checks_on_files(file_lines_map):
                             if re.search(r'\bif\s*\(\s*' + re.escape(v) + r'\s*\)', check_line):
                                 checked = True
                                 break
+                            # --- Новый блок: косвенная проверка через функцию ---
+                            # ищем if (<function>(v, ...) == NULL) или if (<function>(v, ...) == 0)
+                            func_call_null = re.search(
+                                r'\bif\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*' + re.escape(v) + r'[\s,)]',
+                                check_line
+                            )
+                            if func_call_null:
+                                # ищем сравнение результата вызова с NULL или 0
+                                # Пример: if (input_arr(arr, n) == NULL)
+                                after = check_line[func_call_null.end()-1:]
+                                if re.search(r'==\s*NULL', after) or re.search(r'==\s*0', after) or re.search(r'!=\s*NULL', after) or re.search(r'!=\s*0', after):
+                                    checked = True
+                                    break
                         if not checked:
                             issues.append({'file': path, 'line': k+1, 'rule': 15, 'message': "Результат malloc|realloc|calloc не обработан (правило 15)."})
                 # Rule 25 & 26: forbid exit/goto inside function
@@ -537,30 +550,80 @@ def run_checks_on_files(file_lines_map):
             # Эвристика: определяем, похоже ли это на объявление переменной.
             # Требуем: в блоке присутствует идентификатор переменной, и либо есть '=' либо '[' либо сам факт "type name;".
             # Дополнительно игнорируем явные 'extern' если вы хотите разрешать extern — здесь мы не игнорируем 'extern' автоматически.
-            var_match = re.search(
-                r'^\s*(?:static|const|volatile|unsigned|signed|register|extern)?\s*'           # опционально storage-class
-                r'(?:struct|enum|union|[A-Za-z_][A-Za-z0-9_\s\*]+?)\s+'                        # тип (включая указатели)
-                r'([A-Za-z_][A-Za-z0-9_]*)'                                                    # имя переменной
-                r'\s*(?:\[.*\]|\=.+)?\s*;\s*$',                                               # массив или инициализация или просто ';'
-                tok, re.S)
-            if var_match:
-                var_name = var_match.group(1)
-                # Дополнительная фильтрация: если строка содержит '(' — это скорее функция; мы уже исключили, но на всякий случай:
-                if '(' not in tok:
-                    # Теперь убедимся, что это не просто "extern ..." если вы хотите разрешать extern, можно пропустить:
-                    if re.match(r'^\s*extern\b', tok):
-                        # Если вы хотите считать extern глобальной переменной — уберите этот continue
-                        i = j
-                        continue
-                    # Это вероятная глобальная переменная — добавляем issue
+            # Найти первую функцию (или все функции), чтобы знать, где заканчивается "глобальная" область
+            first_func_line = None
+            for idx_l, l in enumerate(lines):
+                if func_def_re.match(l.strip()):
+                    first_func_line = idx_l
+                    break
+
+            # Ограничить область поиска только до первой функции (или до 300 строк, если функций нет)
+            scan_limit = first_func_line if first_func_line is not None else min(len(lines), 300)
+            search_region = lines[:scan_limit]
+
+            i = 0
+            while i < len(search_region):
+                line = search_region[i]
+                # пропускаем препроцессорные директивы и пустые / комментированные строки
+                if line.strip().startswith('#') or re.match(r'^\s*//', line) or re.match(r'^\s*/\*', line):
+                    i += 1
+                    continue
+
+                # собираем блок до ближайшего ';' или до конца области
+                block_lines = []
+                start_line_no = i + 1  # 1-based
+                j = i
+                found_semicolon = False
+                while j < len(search_region):
+                    block_lines.append(search_region[j])
+                    if ';' in search_region[j]:
+                        found_semicolon = True
+                        j += 1
+                        break
+                    j += 1
+
+                if not found_semicolon:
+                    i = j
+                    continue
+
+                raw_block = '\n'.join(block_lines)
+                no_comments = re.sub(r'/\*.*?\*/', '', raw_block, flags=re.S)
+                no_comments = re.sub(r'//.*', '', no_comments)
+                tok = no_comments.strip()
+
+                # пропускаем typedef, struct/enum/union объявления, прототипы функций, extern/static
+                if re.match(r'^\s*typedef\b', tok):
+                    i = j
+                    continue
+                if re.match(r'^\s*(struct|enum|union)\b[^{;]*;\s*$', tok):
+                    i = j
+                    continue
+                if '(' in tok and ')' in tok:
+                    i = j
+                    continue
+                if re.match(r'^\s*extern\b', tok):
+                    i = j
+                    continue
+                if re.match(r'^\s*static\b', tok):
+                    i = j
+                    continue
+
+                # Только здесь ищем глобальные переменные!
+                var_match = re.search(
+                    r'^\s*(?:const|volatile|unsigned|signed|register)?\s*'           # storage-class без extern/static
+                    r'(?:struct|enum|union|[A-Za-z_][A-Za-z0-9_\s\*]+?)\s+'          # тип
+                    r'([A-Za-z_][A-Za-z0-9_]*)'                                      # имя
+                    r'\s*(?:$$.*$$|\=.+)?\s*;\s*$',                                  # массив/инициализация/;
+                    tok, re.S)
+                if var_match:
+                    var_name = var_match.group(1)
                     issues.append({
                         'file': path,
                         'line': start_line_no,
-                        'rule': 14,   # или 27, как у вас было — подставьте нужный номер правила
-                        'message': f"Обнаружена вероятная глобальная переменная '{var_name}' (правило 14). Рекомендуется избегать глобальных переменных."
+                        'rule': 27,
+                        'message': f"Обнаружена вероятная глобальная переменная '{var_name}' (правило 27). Рекомендуется избегать глобальных переменных."
                     })
-            # Продолжаем после обработанного блока
-            i = j
+                i = j
 
 
     return issues
@@ -650,14 +713,14 @@ def main():
         # check pipeline success
         ok_pipeline = mr_has_successful_pipeline(project_id, mr_iid)
         if not ok_pipeline:
-            logging.info(f"  Skipping MR !{mr_iid}: latest pipeline not successful.")
+            logging.info(f"  Skipping MR !{mr_iid} by {mr_author}: latest pipeline not successful.")
             #logging.info(f"  Logged: skipped due to pipeline")
             continue
 
         # check unresolved discussions
         unresolved = mr_has_unresolved_discussions(project_id, mr_iid)
         if unresolved:
-            logging.info(f"  Skipping MR !{mr_iid}: has unresolved discussions.")
+            logging.info(f"  Skipping MR !{mr_iid} by {mr_author}: has unresolved discussions.")
             #logging.info(f"  Logged: skipped due to unresolved discussions")
             #continue
 
@@ -665,7 +728,7 @@ def main():
         files = fetch_changed_c_files(project_id, mr_iid, source_branch)
         if not files and not title_issues:
             # nothing to check, but if title issue exists we will still post
-            logging.info(f"  No changed C/H files found for MR !{mr_iid}.")
+            logging.info(f"  No changed C/H files found for MR !{mr_iid} by {mr_author}.")
         # run checks
         issues = []
         if files:
@@ -677,23 +740,23 @@ def main():
 
         # Post inline comments (if possible) and produce summary
         if not issues:
-            summary = ("Вас проверила автоматика Lint-Bot: не найдено нарушений.\n\n"
+            summary = (":white_check_mark Вас проверила автоматика Lint-Bot :cop: : не найдено нарушений. Lint-Bot :cop: доволен\n\n"
                        "Проверены правила: 0..29.\n\n")
-            logging.info(f"  MR !{mr_iid}: no issues found.")
+            logging.info(f"  MR !{mr_iid} by {mr_author}: no issues found.")
             # Approve if configured
             if APPROVE_ON_PASS:
                 ok = approve_mr(project_id, mr_iid)
                 if ok:
-                    logging.info(f"  Approved MR !{mr_iid}.")
+                    logging.info(f"  Approved MR !{mr_iid} by {mr_author}.")
                     summary += "\nРешение: Автоматически установлен Approve.\n"
                 else:
                     summary += "\nРешение: Approve не установлен (check token/permissions).\n"
             post_mr_summary(project_id, mr_iid, summary)
-            logging.info(f"  Logged: reviewed and approved (if enabled) MR !{mr_iid}.")
+            logging.info(f"  Logged: reviewed and approved (if enabled) MR !{mr_iid} by {mr_author}.")
             continue
 
         # Build summary text
-        summary_lines = ["Вас проверила автоматика Lint-Bot: найдены возможные нарушения.", "", "Результат:"]
+        summary_lines = [":x: Вас проверила автоматика Lint-Bot :cop: : найдены возможные нарушения.", "", "Результат:"]
         for it in issues:
             fl = f"{it['file']}:{it['line']}" if it.get('file') and it.get('line') else (it.get('file') or "(project)")
             summary_lines.append(f"- Rule {it['rule']}: {fl} — {it['message']}")
@@ -712,8 +775,9 @@ def main():
 
         # Post summary note
         post_mr_summary(project_id, mr_iid, "Результаты автоматического ревью:\n\n" + summary_text)
-        logging.info(f"  MR !{mr_iid}: posted summary; inline posted: {inline_posted}")
-        logging.info(f"  Logged: reviewed MR !{mr_iid} with {len(issues)} issues.")
+        logging.info(f"  MR !{mr_iid} by {mr_author}: summary: {summary_text} ")
+        logging.info(f"  MR !{mr_iid} by {mr_author}: posted summary; inline posted: {inline_posted}")
+        logging.info(f"  Logged: reviewed MR !{mr_iid} by {mr_author} with {len(issues)} issues.")
 
 if __name__ == "__main__":
     try:
