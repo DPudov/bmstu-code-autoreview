@@ -217,14 +217,18 @@ def run_checks_on_files(file_lines_map):
             ln = re.sub(r'"([^"\\]|\\.)*"', '', ln)
             ln = re.sub(r"'([^'\\]|\\.)*'", '', ln)
 
-            # Strict pattern: & <identifier> [ <expr> ]
-            if re.search(r'&\s*[A-Za-z_][A-Za-z0-9_]*\s*\[\s*[^]]+\s*\]', ln):
-                issues.append({
-                    'file': path,
-                    'line': i,
-                    'rule': 0,
-                    'message': "&arr[i] запрещено. БАН (правило 0)."
-                })
+            pattern = r'(^|\s)&\s*([A-Za-z_][A-Za-z0-9_]*)\s*$$[^$$]+\]'
+            match = re.search(pattern, ln)
+            if match:
+                # Проверяем, что после ] нет сразу )
+                end_pos = match.end()
+                if end_pos >= len(ln) or ln[end_pos] not in (')', '*'):
+                    issues.append({
+                        'file': path,
+                        'line': i,
+                        'rule': 0,
+                        'message': "&arr[i] запрещено. БАН (правило 0)."
+                    })
             # naming detection: look for function definitions
             m = func_def_re.match(line.strip())
             if m:
@@ -389,17 +393,46 @@ def run_checks_on_files(file_lines_map):
                             issues.append({'file': path, 'line': k+1, 'rule': 8, 'message': "scanf: возвращаемое значение не проверяется (правило 8)."})
                 # Rule 15: check malloc result checked (heuristic: look for malloc and subsequent NULL check)
                 for k in range(start_idx, min(end_idx+1, nlines)):
-                    if malloc_re.search(lines[k]):
-                        # find allocation var name by parsing assignment
-                        assign_m = re.search(r'([A-Za-z_][A-Za-z0-9_]*)\s*=\s*.*\b(malloc|realloc|calloc)\s*\(', lines[k])
+                    line = lines[k]
+                    # 1. malloc внутри условия if/while
+                    if re.search(r'\b(if|while)\s*\(\s*!\s*\(*\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(malloc|realloc|calloc)\s*\(', line):
+                        continue  # обработка есть: if (!(p = malloc(...)))
+                    # 2. обычное присваивание
+                    m = re.search(r'([A-Za-z_][A-Za-z0-9_]*)\s*=\s*.*\b(malloc|realloc|calloc)\s*\(', line)
+                    if m:
+                        v = m.group(1)
                         checked = False
-                        if assign_m:
-                            v = assign_m.group(1)
-                            # search following few lines for 'if (v == NULL)' or 'if (!v)'
-                            for t in range(k, min(k+6, end_idx+1)):
-                                if re.search(r'\b' + re.escape(v) + r'\b\s*==\s*NULL', lines[t]) or re.search(r'!\s*' + re.escape(v), lines[t]):
-                                    checked = True
-                                    break
+                        # ищем обработку в ближайших 10 строках или до конца функции
+                        for t in range(k+1, min(k+11, end_idx+1)):
+                            check_line = lines[t]
+                            # Проверка на NULL, 0, !v, v == 0, v != 0, v == NULL, v != NULL
+                            if re.search(r'\bif\s*\(\s*!\s*' + re.escape(v) + r'\s*\)', check_line):
+                                checked = True
+                                break
+                            if re.search(r'\bif\s*\(\s*' + re.escape(v) + r'\s*==\s*NULL\s*\)', check_line):
+                                checked = True
+                                break
+                            if re.search(r'\bif\s*\(\s*' + re.escape(v) + r'\s*==\s*0\s*\)', check_line):
+                                checked = True
+                                break
+                            if re.search(r'\bif\s*\(\s*' + re.escape(v) + r'\s*!=\s*NULL\s*\)', check_line):
+                                checked = True
+                                break
+                            if re.search(r'\bif\s*\(\s*' + re.escape(v) + r'\s*!=\s*0\s*\)', check_line):
+                                checked = True
+                                break
+                            # assert(v != NULL)
+                            if re.search(r'assert\s*\(\s*' + re.escape(v) + r'\s*!=\s*NULL\s*\)', check_line):
+                                checked = True
+                                break
+                            # return if allocation failed
+                            if re.search(r'\bif\s*\(\s*!\s*' + re.escape(v) + r'\s*\)\s*return', check_line):
+                                checked = True
+                                break
+                            # иногда пишут просто if (v)
+                            if re.search(r'\bif\s*\(\s*' + re.escape(v) + r'\s*\)', check_line):
+                                checked = True
+                                break
                         if not checked:
                             issues.append({'file': path, 'line': k+1, 'rule': 15, 'message': "Результат malloc|realloc|calloc не обработан (правило 15)."})
                 # Rule 25 & 26: forbid exit/goto inside function
@@ -597,12 +630,29 @@ def main():
         if not re.search(r'(?i)\blab\s*\d+\b', mr_title):
             title_issues.append({'file': None, 'line': None, 'rule': 0, 'message': "Назовите понятно merge request (например, 'lab 1') (правило 0)."})
 
+        # Проверка на наличие конфликтов слияния
+        conflict_issues = []
+        if mr.get("has_conflicts"):
+            conflict_issues.append({'file': None, 'line': None, 'rule': 0, 'message': "В Merge Request обнаружены конфликты слияния. Их необходимо разрешить перед merge."})
+
+        # Проверка на неразрешённые дискуссии
+        discussion_issues = []
+        # Получаем список дискуссий MR (например, через API)
+        # Здесь предполагается, что mr["discussions"] — это список дискуссий, каждая из которых — словарь с ключом 'resolved'
+        # Если у вас другой способ получения дискуссий, адаптируйте этот блок.
+        discussions = mr.get("discussions", [])
+        for d in discussions:
+            if not d.get("resolved", True):
+                discussion_issues.append({'file': None, 'line': None, 'rule': 0, 'message': "В Merge Request есть неразрешённые дискуссии. Пожалуйста, разрешите все обсуждения перед слиянием."})
+            break  # достаточно одного неразрешённого обсуждения
+
+
         # check pipeline success
         ok_pipeline = mr_has_successful_pipeline(project_id, mr_iid)
         if not ok_pipeline:
             logging.info(f"  Skipping MR !{mr_iid}: latest pipeline not successful.")
             #logging.info(f"  Logged: skipped due to pipeline")
-            #continue
+            continue
 
         # check unresolved discussions
         unresolved = mr_has_unresolved_discussions(project_id, mr_iid)
@@ -622,6 +672,8 @@ def main():
             issues = run_checks_on_files(files)
         # include title issues if any
         issues.extend(title_issues)
+        issues.extend(conflict_issues)
+        issues.extend(discussion_issues)
 
         # Post inline comments (if possible) and produce summary
         if not issues:
@@ -635,7 +687,7 @@ def main():
                     logging.info(f"  Approved MR !{mr_iid}.")
                     summary += "\nРешение: Автоматически установлен Approve.\n"
                 else:
-                    summary += "\Решение: Approve не установлен (check token/permissions).\n"
+                    summary += "\nРешение: Approve не установлен (check token/permissions).\n"
             post_mr_summary(project_id, mr_iid, summary)
             logging.info(f"  Logged: reviewed and approved (if enabled) MR !{mr_iid}.")
             continue
